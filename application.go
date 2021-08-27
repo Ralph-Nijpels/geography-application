@@ -16,12 +16,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// Context describes the environment of the application including
+// AppContext describes the environment of the application including
 // permanent connections and defaults
-type Context struct {
+type AppContext struct {
 	S3Client       *minio.Client
 	DBClient       *mongo.Client
 	DBContext      context.Context
+	DBCancel       context.CancelFunc
 	logBuffer      *bytes.Buffer
 	logTopic       string
 	MaxResults     int64
@@ -72,14 +73,7 @@ func readOptions() (*optionFile, error) {
 	return &options, nil
 }
 
-// GetContext reads the application options and initializes permanent connections and defaults
-func GetContext() (*Context, error) {
-
-	applicationOptions, err := readOptions()
-	if err != nil {
-		return nil, err
-	}
-
+func (appContext *AppContext) connectMinio(applicationOptions *optionFile) error {
 	// Connect to S3
 	minioClient, err := minio.New(
 		applicationOptions.Storage.Server,
@@ -87,51 +81,74 @@ func GetContext() (*Context, error) {
 		applicationOptions.Storage.Secret,
 		false)
 	if err != nil {
-		log.Panicf("Unable to connect to S3-storage: %v\n", err)
+		return err
 	}
 
 	// Check the csv bucket
 	bucketFound, err := minioClient.BucketExists("csv")
 	if err != nil {
-		log.Panicf("Connection problem S3-storage: %v\n", err)
+		return err
 	}
 	if !bucketFound {
 		err = minioClient.MakeBucket("csv", "us-east-1")
 		if err != nil {
-			log.Panicf("Connection problem S3-storage: %v\n", err)
+			return err
 		}
 	}
 
 	// Check the log bucket
 	bucketFound, err = minioClient.BucketExists("log")
 	if err != nil {
-		log.Panicf("Connection problem S3-storage: %v\n", err)
+		return err
 	}
 	if !bucketFound {
 		err = minioClient.MakeBucket("log", "us-east-1")
 		if err != nil {
-			log.Panicf("Connection problem S3-storage: %v\n", err)
+			return err
 		}
 	}
 
+	// Register result
+	appContext.S3Client = minioClient
+
+	return nil
+}
+
+func (appContext *AppContext) connectMongo(applicationOptions *optionFile) error {
 	// Connect to MongoDB
-	clientOptions := options.Client().ApplyURI(applicationOptions.Database)
-	client, err := mongo.Connect(context.TODO(), clientOptions)
+	dbContext, dbCancel := context.WithTimeout(context.Background(), time.Second*10)
+	dbOptions := options.Client().ApplyURI(applicationOptions.Database).SetDirect(true)
+	dbClient, err := mongo.Connect(dbContext, dbOptions)
 	if err != nil {
-		return nil, err
+		dbCancel()
+		return err
 	}
 
 	// Check the connection
-	err = client.Ping(context.TODO(), nil)
+	err = dbClient.Ping(dbContext, nil)
+	if err != nil {
+		dbCancel()
+		return err
+	}
+
+	// Register it
+	appContext.DBClient = dbClient
+	appContext.DBContext = dbContext
+	appContext.DBCancel = dbCancel
+
+	return nil
+}
+
+// CreateAppContext reads the application options and initializes permanent connections and defaults
+func CreateAppContext() (*AppContext, error) {
+
+	applicationOptions, err := readOptions()
 	if err != nil {
 		return nil, err
 	}
 
-	// Compose result
-	context := Context{
-		S3Client:       minioClient,
-		DBClient:       client,
-		DBContext:      context.TODO(),
+	// Set up appContext
+	appContext := AppContext{
 		MaxResults:     applicationOptions.MaxResults,
 		CountriesURL:   applicationOptions.Source.CountriesURL,
 		RegionsURL:     applicationOptions.Source.RegionsURL,
@@ -139,49 +156,66 @@ func GetContext() (*Context, error) {
 		RunwaysURL:     applicationOptions.Source.RunwaysURL,
 		FrequenciesURL: applicationOptions.Source.FrequenciesURL}
 
-	return &context, nil
+	// Connect to Minio
+	err = appContext.connectMinio(applicationOptions)
+	if err != nil {
+		return nil, err
+	}
 
+	// Connect to Mongo
+	err = appContext.connectMongo(applicationOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return &appContext, nil
 }
 
 // LogFile creates a new logfile for the given topic in the logfolder
-func (context *Context) LogFile(topic string) (io.Writer, error) {
+func (appContext *AppContext) LogFile(topic string) (io.Writer, error) {
 
-	context.logBuffer = new(bytes.Buffer)
-	context.logTopic = topic
-	log.SetOutput(context.logBuffer)
+	appContext.logBuffer = new(bytes.Buffer)
+	appContext.logTopic = topic
+	log.SetOutput(appContext.logBuffer)
 
-	return context.logBuffer, nil
+	return appContext.logBuffer, nil
 }
 
 // LogPrintln inserts a message in the logfile
-func (context *Context) LogPrintln(s string) {
+func (appContext *AppContext) LogPrintln(s string) {
 	if len(s) != 0 {
 		log.Println(s)
 	}
 }
 
 // LogError inserts an error in the logfile if there is one
-func (context *Context) LogError(err error) {
+func (appContext *AppContext) LogError(err error) {
 	if err != nil {
 		log.Println(err)
 	}
 }
 
 // LogClose moves the buffer to S3 in one go
-func (context *Context) LogClose() {
+func (appContext *AppContext) LogClose() {
 
 	log.SetOutput(os.Stderr)
 
 	logDate := time.Now().Format("20060102-150405")
-	logName := fmt.Sprintf("%s-%s.txt", context.logTopic, logDate)
+	logName := fmt.Sprintf("%s-%s.txt", appContext.logTopic, logDate)
 
-	s3Client := context.S3Client
-	_, err := s3Client.PutObject("log", logName, context.logBuffer, -1,
+	s3Client := appContext.S3Client
+	_, err := s3Client.PutObject("log", logName, appContext.logBuffer, -1,
 		minio.PutObjectOptions{ContentType: "text/plain"})
-	context.logBuffer = nil
+	appContext.logBuffer = nil
 
 	if err != nil {
 		log.Panicf("Could not write logfile\n")
 	}
 
+}
+
+func (appContext *AppContext) Destroy() {
+	if appContext.DBCancel != nil {
+		appContext.DBCancel()
+	}
 }
