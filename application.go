@@ -19,6 +19,7 @@ import (
 // AppContext describes the environment of the application including
 // permanent connections and defaults
 type AppContext struct {
+	options        *optionFile
 	S3Client       *minio.Client
 	DBClient       *mongo.Client
 	DBContext      context.Context
@@ -114,10 +115,38 @@ func (appContext *AppContext) connectMinio(applicationOptions *optionFile) error
 	return nil
 }
 
-func (appContext *AppContext) connectMongo(applicationOptions *optionFile) error {
+// CreateAppContext reads the application options and initializes permanent connections and defaults
+func CreateAppContext() (*AppContext, error) {
+
+	applicationOptions, err := readOptions()
+	if err != nil {
+		return nil, err
+	}
+
+	// Set up appContext
+	appContext := AppContext{
+		options:        applicationOptions,
+		MaxResults:     applicationOptions.MaxResults,
+		CountriesURL:   applicationOptions.Source.CountriesURL,
+		RegionsURL:     applicationOptions.Source.RegionsURL,
+		AirportsURL:    applicationOptions.Source.AirportsURL,
+		RunwaysURL:     applicationOptions.Source.RunwaysURL,
+		FrequenciesURL: applicationOptions.Source.FrequenciesURL}
+
+	// Connect to Minio
+	err = appContext.connectMinio(applicationOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return &appContext, nil
+}
+
+// DBOpen connects to the MongoDB, which we cannot keep open for too long
+func (appContext *AppContext) DBOpen() error {
 	// Connect to MongoDB
 	dbContext, dbCancel := context.WithTimeout(context.Background(), time.Second*10)
-	dbOptions := options.Client().ApplyURI(applicationOptions.Database).SetDirect(true)
+	dbOptions := options.Client().ApplyURI(appContext.options.Database).SetDirect(true)
 	dbClient, err := mongo.Connect(dbContext, dbOptions)
 	if err != nil {
 		dbCancel()
@@ -139,36 +168,24 @@ func (appContext *AppContext) connectMongo(applicationOptions *optionFile) error
 	return nil
 }
 
-// CreateAppContext reads the application options and initializes permanent connections and defaults
-func CreateAppContext() (*AppContext, error) {
-
-	applicationOptions, err := readOptions()
-	if err != nil {
-		return nil, err
+// DBClose disconnects from the MongoDB
+func (appContext *AppContext) DBClose() error {
+	// Already closed
+	if appContext.DBClient == nil {
+		return nil
 	}
 
-	// Set up appContext
-	appContext := AppContext{
-		MaxResults:     applicationOptions.MaxResults,
-		CountriesURL:   applicationOptions.Source.CountriesURL,
-		RegionsURL:     applicationOptions.Source.RegionsURL,
-		AirportsURL:    applicationOptions.Source.AirportsURL,
-		RunwaysURL:     applicationOptions.Source.RunwaysURL,
-		FrequenciesURL: applicationOptions.Source.FrequenciesURL}
-
-	// Connect to Minio
-	err = appContext.connectMinio(applicationOptions)
-	if err != nil {
-		return nil, err
+	// And not dropped
+	if appContext.DBContext.Err() == nil {
+		appContext.DBClient.Disconnect(appContext.DBContext)
 	}
 
-	// Connect to Mongo
-	err = appContext.connectMongo(applicationOptions)
-	if err != nil {
-		return nil, err
-	}
+	// Register it
+	appContext.DBClient = nil
+	appContext.DBContext = nil
+	appContext.DBCancel = nil
 
-	return &appContext, nil
+	return nil
 }
 
 // LogFile creates a new logfile for the given topic in the logfolder
