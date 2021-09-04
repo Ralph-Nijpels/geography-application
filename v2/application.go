@@ -20,9 +20,7 @@ import (
 // permanent connections and defaults
 type AppContext struct {
 	S3Client       *minio.Client
-	DBClient       *mongo.Client
-	DBContext      context.Context
-	DBCancel       context.CancelFunc
+	DBURI          string
 	logBuffer      *bytes.Buffer
 	logTopic       string
 	MaxResults     int64
@@ -31,6 +29,12 @@ type AppContext struct {
 	AirportsURL    string
 	RunwaysURL     string
 	FrequenciesURL string
+}
+
+type MongoClient struct {
+	DBClient  *mongo.Client
+	DBContext context.Context
+	dbCancel  context.CancelFunc
 }
 
 // Optionfile descibes the content of the options file
@@ -114,32 +118,6 @@ func (appContext *AppContext) connectMinio(applicationOptions *optionFile) error
 	return nil
 }
 
-func (appContext *AppContext) connectMongo(applicationOptions *optionFile) error {
-
-	// Connect to MongoDB
-	dbContext, dbCancel := context.WithTimeout(context.Background(), time.Second*10)
-	dbOptions := options.Client().ApplyURI(applicationOptions.Database).SetDirect(true)
-	dbClient, err := mongo.Connect(dbContext, dbOptions)
-	if err != nil {
-		dbCancel()
-		return err
-	}
-
-	// Check the connection
-	err = dbClient.Ping(dbContext, nil)
-	if err != nil {
-		dbCancel()
-		return err
-	}
-
-	// Register it
-	appContext.DBClient = dbClient
-	appContext.DBContext = dbContext
-	appContext.DBCancel = dbCancel
-
-	return nil
-}
-
 // CreateAppContext reads the application options and initializes permanent connections and defaults
 func CreateAppContext() (*AppContext, error) {
 
@@ -163,13 +141,58 @@ func CreateAppContext() (*AppContext, error) {
 		return nil, err
 	}
 
-	// Connect to Mongo
-	err = appContext.connectMongo(applicationOptions)
+	// Connection to Mongo
+	appContext.DBURI = applicationOptions.Database
+
+	return &appContext, nil
+}
+
+// DBOpen connects to the MongoDB, which we cannot keep open for too long
+func (appContext *AppContext) DBOpen() (*MongoClient, error) {
+
+	// Connect to MongoDB
+	dbContext, dbCancel := context.WithTimeout(context.Background(), time.Second*10)
+	dbOptions := options.Client().ApplyURI(appContext.DBURI).SetDirect(true)
+	dbClient, err := mongo.Connect(dbContext, dbOptions)
 	if err != nil {
+		dbCancel()
 		return nil, err
 	}
 
-	return &appContext, nil
+	// Check the connection
+	err = dbClient.Ping(dbContext, nil)
+	if err != nil {
+		dbCancel()
+		return nil, err
+	}
+
+	// Register it
+	return &MongoClient{
+		DBClient:  dbClient,
+		DBContext: dbContext,
+		dbCancel:  dbCancel,
+	}, nil
+}
+
+// DBClose disconnects from the MongoDB
+func (mongoClient *MongoClient) DBClose() error {
+	// Already closed
+	if mongoClient.DBClient == nil || mongoClient.DBContext == nil {
+		return nil
+	}
+
+	// And not dropped
+	if mongoClient.DBContext.Err() == nil {
+		mongoClient.DBClient.Disconnect(mongoClient.DBContext)
+		mongoClient.dbCancel()
+	}
+
+	// Register it
+	mongoClient.DBClient = nil
+	mongoClient.DBContext = nil
+	mongoClient.dbCancel = nil
+
+	return nil
 }
 
 // LogFile creates a new logfile for the given topic in the logfolder
@@ -216,10 +239,4 @@ func (appContext *AppContext) LogClose() {
 }
 
 func (appContext *AppContext) Destroy() {
-	// If the context is in an error-state the resources have usually already been
-	// released and calling DBCancel will just result in a bunch of null-pointer
-	// references.
-	if appContext.DBContext.Err() == nil && appContext.DBCancel != nil {
-		appContext.DBCancel()
-	}
 }
